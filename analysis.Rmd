@@ -1,0 +1,554 @@
+---
+title: "Ecommerce Product Analytics & Customer Segmentation"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+  pdf_document: default
+---
+
+## Overview
+The goal of this project is demonstrate how to efficiently analyze ecommerce sales data. 
+
+First, I will walk through basic data wrangling, EDA, and product analysis for a retail company's inventory. Next, I will show how to effectively segment users using the RFM framework and k-means clustering. 
+
+I selected the [Online Retail II Data Set](https://archive.ics.uci.edu/ml/datasets/Online+Retail+II) from the UC Irvine Machine Learning Repository as the data source for this analysis. This decision was driven by a few reasons:
+
+- The data set contains online retail transactions from a real UK e-commerce wholesaler
+- There are over 500,000 records in the data set, allowing analytics methods such as customer RFM analysis to be more robust.
+- There are a number of problematic characteristics with this data set. Consequently, it requires cleaning and transformation before it can be effectively analyzed.
+
+For these reasons, I felt this data set would be a compelling example for an end-to-end project.
+
+```{r setup, include=FALSE}
+# Load packages
+library(psych)
+library(DataExplorer)
+library(GGally)
+library(rfm)
+library(reshape2)
+library(Hmisc)
+library(tidyverse)
+library(corrplot)
+library(RColorBrewer)
+library(cluster)
+library(glue)
+library(factoextra)
+library(cluster)
+
+# Turn off scientific notation
+options(scipen=999)
+```
+
+## Import Data
+```{r, message = FALSE}
+# Load data
+df = as_tibble(read_csv("data.csv"))
+
+# Display first 6 rows
+head(df)
+
+# Summarize data
+dim(df)
+```
+This appears to be a suitable dataset for analysis. There are ~540,000 records for 8 variables contained. 
+
+It's important to note that each record represents a single item, not a single invoice. This means that there will be multiple records for each invoice (e.g. a customer's purchase of item 1 and item 2 in a single transaction is shown as two sequential records). We could transform this from a long dataset to a wide dataset in which each row corresponds to an individual invoice. For now, however, this is not required so we'll proceed with this data structure. 
+
+It's also worth nothing that there are some negative values for both quantity and unit price. This will require additional analysis to determine if these are mistakes and should be removed or if there is another explanation (e.g. canceled/refunded order). 
+
+The 8 variables in this dataset are described below:
+
+- Invoice Number: unique identifier for each transaction.
+- Stock Code: unique identifier for each stock unit (item type).
+- Description: text description of each item. Stock Code and Description should be absolutely correlated, as each stock code and description represent the same thing. 
+- Quantity: number of purchases for a given item within a given invoice. 
+- Invoice Date: date of purchase.
+- Unit Price: price of a single item in USD. This should also be perfectly correlated with both stock code and description. 
+- Customer ID: unique identifier for each customer.
+- Country: country of purchaser.
+
+Next, I'll clean up the data set and conduct initial exploratory data analysis to better understand the data.
+
+## Data Cleaning & EDA
+
+#### Clean data
+```{r}
+# Clean dataset
+df = df %>%
+  
+  # Rename variables for consistency
+  rename(invoice_num = InvoiceNo,
+         stock_code = StockCode,
+         description = Description,
+         quantity = Quantity,
+         invoice_date = InvoiceDate,
+         unit_price = UnitPrice,
+         customer_id = CustomerID,
+         country = Country) %>%
+  
+  # Add total price (per item in transaction) variable
+  mutate(total_price = quantity * unit_price) %>%
+  relocate(total_price, .after = unit_price) %>%
+  
+  # Update variable types
+  mutate(customer_id = as.character(customer_id)) %>%
+  mutate(country = as.factor(country)) %>%
+  
+  # Convert to date
+  mutate(invoice_date = as.Date(invoice_date, format="%m/%d/%Y")) %>%
+  
+  # Reorder column
+  relocate(customer_id)
+
+head(df)
+```
+
+```{r echo = FALSE}
+# How many customers?
+customers_unique = length(unique(df$customer_id))
+glue("There are {customers_unique} unique customers in this dataset.")
+
+# How many transactions
+invoices_unique = length(unique(df$invoice_num))
+glue("There are {invoices_unique} unique invoices in this dataset.")
+
+# How many items
+stock_code_unique = length(unique(df$stock_code))
+glue("There are {stock_code_unique} unique stock codes / items in this dataset.")
+
+# How many days represented
+invoice_date_unique = length(unique(df$invoice_date))
+glue("There are {invoice_date_unique} unique invoice dates in this dataset.")
+
+# How many countries represented?
+country_unique = length(unique(df$country))
+glue("There are {country_unique} unique countries in this dataset.")
+```
+
+#### Handle missing values
+```{r}
+plot_intro(df)
+```
+
+This plot shows that a majority of our records are complete with no missing values (75.1%). I'll now need to further investigate the missing values to determine the best handling. 
+
+```{r echo = FALSE}
+plot_missing(df,
+             group = list("No issue" = 0.10, "Investigate further" = 0.5))
+```
+
+It appears nearly all of the missing values are in the customer ID column, of which 25% is missing. This is the key value for identifying customers within the dataset. I need to look closer at this column to make sense of the missing values and handle them accordingly. 
+
+I cannot impute customer ID values due to the nature of the variable, therefore I'll exclude the rows with a missing customer ID from our dataset.
+
+```{r include = FALSE}
+# Remove NAs
+df = drop_na(df)
+
+# Check for NAs
+anyNA(df)
+```
+
+#### Check negative values in quantity
+```{r}
+df_negatives = df[df[5] < 0, ]
+print(df_negatives)
+```
+
+There are just under 9,000 rows where the quantity (and therefore total_price) are negative. One explanation is that these are cancelled or returned orders, in which the charge was reversed or a refund was issued. I could handle this scenario by matching each negative value with a matching positive quantity (with the same customer ID, stock code, description and quantity). However, this is quite a small proportion of our dataset, and I do not have evidence of our theory, so I will simply remove the negative values from the dataset.
+
+```{r include = FALSE}
+# Get rows with negative values
+rows_remove = which(df$quantity < 0)
+
+# Remove negative value rows from dataframe 
+df = df[-c(rows_remove), ]
+
+# Check for negatives
+which(df$quantity < 0)
+which(df$unit_price < 0)
+which(df$total_price < 0)
+```
+
+#### Check unique values again after cleaning data
+```{r echo = FALSE}
+# How many customers?
+customers_unique = length(unique(df$customer_id))
+glue("There are {customers_unique} unique customers in this dataset.")
+
+# How many transactions
+invoices_unique = length(unique(df$invoice_num))
+glue("There are {invoices_unique} unique invoices in this dataset.")
+
+# How many items
+stock_code_unique = length(unique(df$stock_code))
+glue("There are {stock_code_unique} unique stock codes / items in this dataset.")
+
+# How many days represented
+invoice_date_unique = length(unique(df$invoice_date))
+glue("There are {invoice_date_unique} unique invoice dates in this dataset.")
+
+# How many countries represented?
+country_unique = length(unique(df$country))
+glue("There are {country_unique} unique countries in this dataset.")
+```
+
+Now that we have cleaned the data, handled the missing values and handled the negative values, I'll proceed with the analysis. My analysis will be broken into 2 sections:
+
+1. SKU Analysis
+
+2. RFM Customer Segmentation
+
+## SKU (Stock Keeping Unit) Analysis
+
+The aim of this section is to explore how sales differ across different SKUs for this seller. More specifically, I'm interested in understanding which SKUs are the highest and lowest grossing items and involved in the most or least number of transactions. This type of information would be useful to a management team in making inventory and marketing decisions such as:
+
+* Which products should we buy more of?
+* Which products should we stop selling?
+* Which products do we need to promote more?
+
+To start answering these questions, I'll first need to transform the data into a structure that allows me to analyze the data at the SKU-level, not the invoice level. To do this, I will group the data by stock code and description, then aggregate the total revenue and units sold. I'll also calculate the number of unique transactions each SKU was involved in. 
+
+#### Transform dataframe to make each row equal to a specific stock unit
+```{r}
+# Group by stock code and summarize total revenue, total units sold
+sku_df = df %>%
+    
+  # Group by stock code
+  group_by(stock_code, description) %>%
+  
+  # Summarize key vars - total revenue, number of units sold, and number of unique transactions per item
+  summarise(total_revenue = sum(total_price),
+            units_sold = sum(quantity),
+            unique_invoices = n_distinct(invoice_num),
+            unit_price = round(mean(unit_price), digits=2)) %>%
+  
+  # Sort by total revenue
+  arrange(desc(total_revenue))
+  
+# Print results  
+sku_df
+```
+
+#### Top 10 revenue-generating items
+```{r}
+library(forcats)
+
+# Top 10 total_revenue
+sku_top10_rev = head(sku_df, 10)
+
+# Plot top 10
+sku_top10_rev %>%
+  ggplot(aes(reorder(description, total_revenue), total_revenue)) + 
+  geom_col(fill = "steelblue") + 
+  xlab("Top Ten SKUs by Revenue") + 
+  ylab("Total Revenue") + 
+  scale_y_continuous(labels = scales::dollar_format()) + 
+  coord_flip() + 
+  theme_bw()
+```
+Now that I have identified the top 10 revenue-generating SKUs, I want to understand the impact these 10 items have in proportion to all SKUs. 
+
+```{r}
+# Get names
+top10rev = sku_top10_rev$description
+
+# Create a top_10 label
+sku_df = sku_df %>%
+  mutate(top10_rev = ifelse(description %in% top10rev, 1, 0))
+
+# Top 10 items generate nearly 10% of the company's revenue
+sku_df %>%
+  group_by(top10_rev) %>%
+  summarise(revenue = sum(total_revenue),
+            num_skus = n()) %>%
+  mutate(prop_rev = revenue / sum(revenue),
+         prop_skus = num_skus / sum(num_skus))
+```
+
+The table above shows top 10 highest-grossing SKUs generate ~10% of the total revenue. This is a large proportion given that these items represent only 0.25% of the total SKUs in the retailer's inventory. 
+
+The bottom 10 revenue-generating SKUs can be found below:
+
+```{r}
+# Bottom 10 total_revenue
+sku_bottom10_rev = sku_df %>%
+  group_by(stock_code, description) %>%
+  arrange(total_revenue)
+
+sku_bottom10_rev = head(sku_bottom10_rev, 10)
+
+sku_bottom10_rev %>%
+  ggplot(aes(reorder(description, total_revenue), total_revenue)) + 
+  geom_col(fill = "steelblue") + 
+  xlab("Bottom Ten SKUs by Revenue") + 
+  ylab("Total Revenue") + 
+  scale_y_continuous(labels = scales::dollar_format()) + 
+  coord_flip() + 
+  theme_bw()
+```
+In addition to revenue-generated, I also want to investigate the SKUs that sold the most units.
+
+```{r}
+sku_df_units_desc = sku_df %>%
+  group_by(stock_code, description) %>%
+  arrange(desc(units_sold))
+
+head(sku_df_units_desc, 10)
+```
+
+I also want to look at the items involved in only 1 transaction, as these might be items the seller no longer wants to supply. 
+
+```{r}
+sku_df_low_units_sold = sku_df %>%
+  group_by(stock_code, description) %>%
+  filter(units_sold == 1) %>%
+  arrange(desc(total_revenue))
+
+sku_df_low_units_sold
+```
+
+In addition to revenue and units sold, I am also interested in looking at how many unique transactions each SKU was involved in. 
+
+#### Purchased most frequently
+```{r}
+sku_df_most_invoices = sku_df %>%
+  group_by(stock_code, description) %>%
+  arrange(desc(unique_invoices))
+
+head(sku_df_most_invoices, 10)
+```
+
+Of the top 10 revenue-generating SKUs, 9 were involved in 195 or more transactions. Furthermore, 6 of 10 were involved in over 1,000 transactions. I'll now look at the SKUs purchased least frequently
+
+#### Purchased least frequently
+```{r}
+sku_df_least_invoices = sku_df %>%
+  group_by(stock_code, description) %>%
+  arrange(unique_invoices, desc(total_revenue))
+
+head(sku_df_least_invoices, 10)
+```
+
+Interestingly, the highest-grossing SKU, “Paper Craft, Little Birdie”, was only involved in a single transaction. This was also the only case in which a single SKU invoice resulted in more than 1,000 in revenue. The customer purchased nearly 81,000 units of this item at a $2.08 price point. This was an extreme edge case but helps illustrate the disproportional value and importance of large customers. This is certainly a case the management team would want to further investigate for two primary reasons. First, to better understand this customer’s needs and identify other potential products that could be sold in bulk to this customer. Second, to determine if there is a wider market for this SKU to increase the number of bulk orders.
+
+#### Most expensive units
+```{r}
+sku_df_expensive = sku_df %>%
+  group_by(stock_code, description) %>%
+  arrange(desc(unit_price))
+
+head(sku_df_expensive, 10)
+```
+
+I also included a table with the top 10 most and least expensive SKUs below.
+
+
+#### Least expensive units
+```{r}
+sku_df_cheap = sku_df %>%
+  group_by(stock_code, description) %>%
+  arrange(unit_price)
+
+head(sku_df_cheap, 10)
+```
+
+## RFM Analysis
+
+RFM analysis a technique used to segment customers based on the recency of their last purchase (R), frequency of their purchases (F), and total monetary amount spent (M). This is a common framework used to better understand the different subsets of customers that exist within the total population. Organizations that implement this type of analysis can leverage the insights to build a more nuanced, segment-specific approach to product messaging, marketing and customer engagement strategies. In addition to the initial RFM analysis, I will implement a k-means clustering classification model to statistically robust customer segments. 
+
+Again, the first step here is to transform the data. First, I grouped the data by customer ID then created the new RFM attributes, including the number of days since the last purchase (recency), the total number of transactions (frequency), and the total amount spent (monetary). I then utilized the “rfm” library to calculate a scaled 1-5 score for each customer based on their respective recency, frequency and monetary values. I also created a number of visualizations based on the new RFM scores to better understand the customer population and underlying segments.
+
+#### Create rfm dataframes
+```{r}
+df_recency = df %>%
+  group_by(customer_id) %>%
+  summarise(last_purchase_date = max(invoice_date)) %>%
+  arrange(desc(last_purchase_date))
+
+head(df_recency, 10)
+```
+
+```{r}
+df_frequency = df %>%
+  group_by(customer_id) %>%
+  summarise(num_transactions = n_distinct(invoice_num)) %>%
+  arrange(desc(num_transactions))
+
+head(df_frequency, 10)
+```
+
+```{r}
+df_monetary = df %>%
+  group_by(customer_id) %>%
+  summarise(total_rev = sum(total_price)) %>%
+  arrange(desc(total_rev))
+
+head(df_monetary, 10)
+```
+
+#### Create consolidated dataframe
+```{r}
+# Merge recency with frequency
+df_rfm = merge(df_recency, df_frequency, by="customer_id")
+
+# Add monetary
+df_rfm = merge(df_rfm, df_monetary)
+
+# Inspect results
+#head(df_rfm, 10)
+```
+
+```{r}
+# Get most recent date
+most_recent = max(df_recency$last_purchase_date) 
+
+# Organize RFM table
+df_rfm = df_rfm %>%
+
+  # add new numeric 'days since last purchase' variable
+  mutate(recency_days = as.numeric(most_recent - last_purchase_date)) %>%
+
+  # remove last purchase date
+  select(-last_purchase_date) %>%
+
+  # reorder
+  relocate(recency_days, .after = customer_id)
+
+# Inspect results
+#head(df_rfm, 10)
+```
+
+```{r}
+# Create RFM Table
+rfm_results = rfm_table_customer(data = df_rfm, 
+                                customer_id = customer_id, 
+                                n_transactions = num_transactions,
+                                recency_days = recency_days,
+                                total_revenue = total_rev,
+                                analysis_date = most_recent,
+                                recency_bins = 5,
+                                frequency_bins = 5,
+                                monetary_bins = 5)
+
+head(rfm_results)
+```
+
+#### RFM Visualizations
+```{r echo = FALSE}
+# Heatmap
+rfm_heatmap(rfm_results)
+
+# Barchart
+rfm_bar_chart(rfm_results)
+
+# Histograms
+rfm_histograms(rfm_results)
+
+# Order distribution
+rfm_order_dist(rfm_results)
+
+# Recency & Monetary
+rfm_rm_plot(rfm_results)
+
+# Frequency & Monetary
+rfm_fm_plot(rfm_results)
+
+# Recency & Frequency
+rfm_rf_plot(rfm_results)
+```
+
+#### Data Prep for K-Means Segmentation
+```{r}
+# Create new df
+rfm_scaled = df_rfm
+
+# Scale variables
+rfm_scaled[2:4] = scale(rfm_scaled[2:4])
+
+# Flip sign for recency
+rfm_scaled$recency_days = rfm_scaled$recency_days * -1
+
+# Rename vars
+rfm_scaled = rfm_scaled %>%
+  rename(recency = recency_days,
+         frequency = num_transactions, 
+         monetary = total_rev)
+
+# Inspect results - looks good
+head(rfm_scaled, 10)
+```
+
+```{r}
+# Correlation matrix
+cor_matrix = cor(rfm_scaled[2:4])
+corrplot(cor_matrix, method = "number")
+```
+
+
+I'll now use the elbow method to determine the optimal K values (i.e. number of clusters)
+
+```{r}
+# Set seed for reproducibility
+set.seed(789)
+
+clustering_inputs = rfm_scaled %>%
+  select(-customer_id)
+
+# Get optimal number of clusters
+fviz_nbclust(clustering_inputs, kmeans, method = "wss") + 
+  geom_vline(xintercept = 4, linetype = 2) +
+  labs(subtitle = "Elbow method")
+```
+
+As shown in the chart above, I should use 4 as the optimal number of clusters, as that is where the sum of squares begins to "bend" or level off.
+
+```{r include = FALSE}
+#make this example reproducible
+set.seed(789)
+
+#perform k-means clustering with k = 4 clusters
+km <- kmeans(clustering_inputs, centers = 4, nstart = 25)
+
+#view results
+km
+```
+
+```{r}
+# Plot results of final k-means model
+fviz_cluster(km, data = clustering_inputs, ggtheme=theme_bw())
+```
+
+```{r warning = FALSE}
+# Find means of each cluster
+cluster_results = aggregate(df_rfm, by=list(cluster=km$cluster), mean)
+
+# Print table
+cluster_results = cluster_results %>% 
+  
+  # Format new columns
+  mutate("Cluster Number" = cluster,
+         "Mean Revenue" = scales::dollar(total_rev),
+         "Mean Transactions" = round(num_transactions, digits= 2),
+         "Mean Days Since Last Purchase" = round(recency_days, digits = 2)) %>%
+  
+  # Drop columns
+  select("Cluster Number", "Mean Revenue", "Mean Transactions", "Mean Days Since Last Purchase")
+
+
+# Print table for report
+print(cluster_results)
+```
+
+As both the table and the plot above show, the k-means clustering classification resulted in 4 distinct customer segments. Cluster 1 contains the customers with the highest recency, monetary, and frequency scores. This segment contains the highest value customers that the management team should prioritize going forward. Conversely, Cluster 4 contains the customers with the lowest RFM scores. These are customers that are at risk of being lost. However, they also never spent much money or made frequent purchases, so it likely does not make sense for the management team to pursue them further. Cluster 2 contains customers that have, on average, spent a bit more money, executed a few more transactions, and have a better recency score than Cluster 4 customers. The management team should allocate some resources to continue to attract these customers, but they should not be a high priority given the lower monetary and frequency values. Finally, Cluster 3 represents the customers that fall between Clusters 1 and Clusters 2. In other words, these customers are continuing to spend lots of money and make purchases quite frequently. While they have not yet spent the amount that would group them with top customers in Cluster 1, the management team should heavily prioritize building and maintaining
+relationships with customers in this segment in order to continue to grow the business. It’s important that Cluster 3 customers do not churn and, if possible, are eventually developed into Cluster 1 customers over time.
+
+```{r}
+#add cluster assigment to original data
+final_data <- cbind(df_rfm, cluster = km$cluster)
+
+#view final data
+head(final_data)
+```
+
